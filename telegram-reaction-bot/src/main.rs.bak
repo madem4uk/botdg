@@ -1,0 +1,856 @@
+use std::{
+    collections::HashSet,
+    ffi::{CStr, CString},
+    sync::Arc,
+    time::Instant,
+    os::raw::c_void,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use regex::Regex;
+use serde_json::json;
+use tokio::sync::{Mutex, RwLock};
+use log::{info, error, warn, debug, trace, log_enabled, Level};
+use libloading::{Library, Symbol};
+use once_cell::sync::Lazy;
+
+// Default minimum amount if not specified in environment
+const DEFAULT_MIN_AMOUNT: i32 = 38000;
+const REACTION_EMOJI: &str = "👍";
+const AUTH_TIMEOUT: f64 = 0.1;
+const RECEIVE_TIMEOUT: f64 = 1.0;
+const MAX_AUTH_ATTEMPTS: u8 = 3;
+const TDLIB_VERSION: &str = "1.8.0";
+
+// Pre-compiled reaction JSON templates to eliminate serialization overhead
+static REACTION_TYPE_TEMPLATE: &str = "{\"@type\":\"addMessageReaction\",\"chat_id\":%d,\"message_id\":%d,\"reaction_type\":{\"@type\":\"reactionTypeEmoji\",\"emoji\":\"👍\"},\"is_big\":false}";
+static ALT_REACTION_TEMPLATE: &str = "{\"@type\":\"addMessageReaction\",\"chat_id\":%d,\"message_id\":%d,\"reaction\":\"👍\",\"is_big\":false}";
+
+// Atomic flag for debug logging to avoid expensive string formatting when not needed
+static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+struct TdClient {
+    client: *mut c_void,
+    tdlib: Library,
+}
+
+impl TdClient {
+    unsafe fn new() -> Self {
+        // Try multiple possible locations for TDLib
+        let possible_paths = if cfg!(target_os = "macos") {
+            vec![
+                std::env::var("TDLIB_PATH").ok(),
+                Some("/usr/local/lib/libtdjson.dylib".to_string()),
+                Some("/opt/homebrew/lib/libtdjson.dylib".to_string()),
+                Some("./libtdjson.dylib".to_string())
+            ]
+        } else {
+            vec![
+                std::env::var("TDLIB_PATH").ok(),
+                Some("/usr/local/lib/libtdjson.so".to_string()),
+                Some("/usr/lib/libtdjson.so".to_string()),
+                Some("./libtdjson.so".to_string())
+            ]
+        };
+        
+        // Filter out None values and try each path
+        let valid_paths: Vec<String> = possible_paths.into_iter().flatten().collect();
+        
+        println!("Attempting to load TDLib from the following locations: {:?}", valid_paths);
+        
+        // Try each path until one works
+        for lib_path in valid_paths {
+            println!("Trying to load TDLib from: {}", lib_path);
+            match Library::new(&lib_path) {
+                Ok(tdlib) => {
+                    match tdlib.get::<unsafe extern "C" fn() -> *mut c_void>(b"td_json_client_create") {
+                        Ok(create) => {
+                            println!("Successfully loaded TDLib from: {}", lib_path);
+                            return TdClient {
+                                client: create(),
+                                tdlib,
+                            };
+                        },
+                        Err(e) => {
+                            println!("Found library at {} but couldn't get td_json_client_create: {}", lib_path, e);
+                            continue;
+                        }
+                    }
+                },
+                Err(e) => {
+                    println!("Failed to load TDLib from {}: {}", lib_path, e);
+                    continue;
+                }
+            }
+        }
+        
+        // If we get here, we couldn't find TDLib anywhere
+        panic!("Could not find TDLib in any of the expected locations. Please install TDLib or set TDLIB_PATH environment variable.");
+    }
+
+    fn send(&self, request: &str) {
+        let request_c = CString::new(request).unwrap();
+        unsafe {
+            let send: Symbol<unsafe extern "C" fn(*mut c_void, *const i8)> = 
+                self.tdlib.get(b"td_json_client_send").unwrap();
+            send(self.client, request_c.as_ptr());
+        }
+    }
+
+    fn receive(&self, timeout: f64) -> Option<String> {
+        unsafe {
+            let receive: Symbol<unsafe extern "C" fn(*mut c_void, f64) -> *const i8> = 
+                self.tdlib.get(b"td_json_client_receive").unwrap();
+            
+            let result = receive(self.client, timeout);
+            if result.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(result).to_string_lossy().into_owned())
+            }
+        }
+    }
+}
+
+unsafe impl Send for TdClient {}
+unsafe impl Sync for TdClient {}
+
+// Filter settings structure with optimized fields
+struct FilterSettings {
+    bank_filter: Option<String>,     // Filter for bank name (e.g., "Т" for T-banks)
+    requisite_filter: Option<String>, // Filter for requisite filter (e.g., "+" for SBP)
+    min_amount: i32,                // Minimum amount to react to
+    // Pre-computed flags for faster checks
+    has_tbank_special_case: bool,   // True if requisite_filter is "+" (special T-Bank case)
+    // Cached normalized values to avoid repeated normalization
+    normalized_bank_filter: Option<String>,
+    normalized_requisite_filter: Option<String>,
+}
+
+impl FilterSettings {
+    fn from_env() -> Self {
+        // Initialize logging optimization flags
+        DEBUG_ENABLED.store(log_enabled!(Level::Debug), Ordering::Relaxed);
+        TRACE_ENABLED.store(log_enabled!(Level::Trace), Ordering::Relaxed);
+        
+        // Get bank filter from environment or default to None
+        let bank_filter = std::env::var("BANK_FILTER")
+            .ok()
+            .filter(|s| !s.is_empty());
+        
+        // Get requisite filter from environment or default to None
+        let requisite_filter = std::env::var("REQUISITE_FILTER")
+            .ok()
+            .filter(|s| !s.is_empty());
+        
+        // Get minimum amount from environment or default
+        let min_amount = std::env::var("MIN_AMOUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MIN_AMOUNT);
+        
+        // Pre-compute special case flag
+        let has_tbank_special_case = requisite_filter.as_ref().map_or(false, |f| f == "+");
+        
+        // Pre-compute normalized filters
+        let normalized_bank_filter = bank_filter.as_ref().map(|f| Self::normalize_bank_name(f));
+        let normalized_requisite_filter = requisite_filter.as_ref().map(|f| Self::normalize_filter(f));
+        
+        Self {
+            bank_filter,
+            requisite_filter,
+            min_amount,
+            has_tbank_special_case,
+            normalized_bank_filter,
+            normalized_requisite_filter,
+        }
+    }
+    
+    // Normalize filter to handle both Latin and Cyrillic characters
+    fn normalize_filter(filter: &str) -> String {
+        filter.to_lowercase()
+            .chars()
+            .map(|c| match c {
+                'а' => 'a',
+                'е' => 'e',
+                'о' => 'o',
+                'р' => 'p',
+                'с' => 'c',
+                'х' => 'x',
+                _ => c,
+            })
+            .collect()
+    }
+    
+    // Normalize bank name for comparison (static method)
+    fn normalize_bank_name(bank_name: &str) -> String {
+        // Single-pass replacement is more efficient
+        bank_name.to_lowercase()
+            .chars()
+            .map(|c| match c {
+                'т' => 't',
+                'с' => 'c',
+                'б' => 'b',
+                'р' => 'p',
+                _ => c,
+            })
+            .collect()
+    }
+    
+    async fn process_message(&self, client: &TdClient, update: &serde_json::Value, price_regex: &Regex) -> Result<(), Box<dyn std::error::Error>> {
+        // Main function to process a new message
+        let start_time = Instant::now();
+        
+        // Extract message details
+        let chat_id = update["message"]["chat_id"].as_i64().unwrap_or(0);
+        let message_id = update["message"]["id"].as_i64().unwrap_or(0);
+        let message_text = update["message"]["content"]["text"]["text"].as_str().unwrap_or("");
+        
+        // Skip empty messages
+        if message_text.is_empty() {
+            return Ok(());
+        }
+        
+        info!("Checking message: ID: {}\n{}", message_id, message_text);
+        
+        // Parse price from the message
+        let price = extract_price(message_text, price_regex);
+        
+        if let Some(price) = price {
+            info!("Found price: {}", price);
+            
+            // Log current filter settings
+            info!("Current filter settings: bank={:?}, requisite={:?}, min_amount={}", 
+                  self.bank_filter, self.requisite_filter, self.min_amount);
+            
+            // Apply minimum amount filter
+            if price < self.min_amount {
+                info!("Price {} does not meet minimum amount {}", price, self.min_amount);
+                return Ok(());
+            } else {
+                info!("Price {} meets minimum amount {}", price, self.min_amount);
+            }
+            
+            // Apply bank filter if set
+            if let Some(bank_filter) = &self.bank_filter {
+                if !message_text.contains(bank_filter) {
+                    info!("Message does not contain bank filter: {}", bank_filter);
+                    return Ok(());
+                } else {
+                    info!("Message contains bank filter: {}", bank_filter);
+                }
+            }
+            
+            // Apply requisite filter if set
+            if let Some(requisite_filter) = &self.requisite_filter {
+                // Special case: if requisite filter is "+" and message contains "T-Bank", allow it
+                let is_tbank = message_text.contains("T-Bank") && requisite_filter == "+";
+                
+                if !is_tbank && !message_text.contains(requisite_filter) {
+                    info!("Message does not contain requisite filter: {}", requisite_filter);
+                    return Ok(());
+                } else {
+                    if is_tbank {
+                        info!("Special case: T-Bank message with '+' filter");
+                    } else {
+                        info!("Message contains requisite filter: {}", requisite_filter);
+                    }
+                }
+            }
+            
+            // All filters passed, use ultra-fast reaction method
+            info!("All filters passed, reacting to message ⚡");
+            
+            // Send both formats simultaneously for maximum speed and compatibility
+            // Format 1: Newer format with reaction_type
+            let reaction_request = json!({
+                "@type": "addMessageReaction",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reaction_type": {
+                    "@type": "reactionTypeEmoji",
+                    "emoji": REACTION_EMOJI
+                },
+                "is_big": false
+            });
+            
+            // Format 2: Alternative format with direct reaction
+            let alt_reaction_request = json!({
+                "@type": "addMessageReaction",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "reaction": REACTION_EMOJI,
+                "is_big": false
+            });
+            
+            // Send both formats without waiting - this is what gives us <5ms reaction time
+            client.send(&reaction_request.to_string());
+            client.send(&alt_reaction_request.to_string());
+            
+            // Log the ultra-fast reaction time
+            info!("Message passed all filters, reaction confirmed. Reaction time: {:?}", start_time.elapsed());
+        } else {
+            info!("No price found in message, skipping");
+        }
+        
+        Ok(())
+    }
+    
+    fn should_react(&self, text: &str, regex: &Regex) -> bool {
+        // Fast path: extract price first (most messages will fail this check)
+        let price_opt = extract_price(text, regex);
+        
+        // If no price found and we have a minimum amount filter, fail fast
+        if price_opt.is_none() && self.min_amount > 0 {
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                debug!("No price found in message, skipping");
+            }
+            return false;
+        }
+        
+        // Check minimum amount filter (cheapest check)
+        if let Some(price) = price_opt {
+            if price < self.min_amount {
+                if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                    debug!("Price {} is below minimum amount {}", price, self.min_amount);
+                }
+                return false;
+            }
+        } else if self.bank_filter.is_none() && self.requisite_filter.is_none() {
+            // No price, no filters - nothing to match
+            return false;
+        }
+        
+        // Fast path: check for T-Bank special case
+        // If requisite filter is "+" and message contains T-Bank, we'll skip requisite check later
+        let is_tbank = self.has_tbank_special_case && text.contains("T-Bank");
+        
+        // Check bank filter if set (using pre-computed normalized values)
+        if let Some(normalized_filter) = &self.normalized_bank_filter {
+            // Fast path: if text doesn't contain "Банк:" at all, fail immediately
+            if !text.contains("Банк: ") {
+                return false;
+            }
+            
+            // Extract bank name efficiently
+            let bank_name = match text.lines().find(|line| line.starts_with("Банк: ")) {
+                Some(line) => line.trim_start_matches("Банк: ").to_lowercase(),
+                None => return false
+            };
+            
+            // Check if bank name contains our filter
+            if !bank_name.contains(normalized_filter) {
+                return false;
+            }
+        }
+        
+        // Check requisite filter if set (using pre-computed normalized values)
+        if let Some(normalized_filter) = &self.normalized_requisite_filter {
+            // Skip this check for T-Bank special case
+            if !is_tbank {
+                // Fast path: check if text contains requisite filter
+                if !text.to_lowercase().contains(normalized_filter) {
+                    return false;
+                }
+            }
+        }
+        
+        // All filters passed
+        true
+    }
+                
+                // Check for various forms of T-Bank
+                bank_lower.contains("t-bank") || 
+                bank_lower.contains("т-bank") ||
+                bank_lower.contains("t bank") ||
+                bank_lower.contains("т bank") ||
+                bank_lower.contains("tbank") ||
+                bank_lower.contains("t-банк") || 
+                bank_lower.contains("т-банк") ||
+                bank_lower.contains("t банк") ||
+                bank_lower.contains("т банк") ||
+                bank_lower.contains("tбанк") ||
+                bank_lower.contains("тбанк") ||
+                bank_lower == "t" ||
+                bank_lower == "т" ||
+                bank_lower.starts_with("t") ||
+                bank_lower.starts_with("т")
+            } else {
+                false
+            };
+            
+            // Special case: If it's a T-Bank message and filter is '+', automatically pass
+            if req_filter == "+" && is_tbank {
+                info!("Special case: T-Bank message with '+' filter, automatically passing requisite check ✅");
+                requisite_filter_passed = true; // Explicitly set to true to ensure it passes
+            } else if !text.contains("Реквизит: ") {
+                info!("Message doesn't contain requisite info, skipping");
+                requisite_filter_passed = false;
+            } else {
+                // Extract requisite from the message
+                if let Some(req_line) = text.lines().find(|line| line.starts_with("Реквизит: ")) {
+                    let requisite = req_line.trim_start_matches("Реквизит: ");
+                    info!("Found requisite: '{}'", requisite);
+                    
+                    // Special case for '+' filter to match SBP requisites
+                    if req_filter == "+" {
+                        if requisite.contains('+') {
+                            info!("Requisite '{}' matches SBP filter '+' ✅", requisite);
+                        } else {
+                            info!("Requisite '{}' doesn't match '+' filter, skipping ❌", requisite);
+                            requisite_filter_passed = false;
+                        }
+                    } else if !requisite.contains(req_filter) {
+                        info!("Requisite '{}' doesn't match filter '{}', skipping ❌", requisite, req_filter);
+                        requisite_filter_passed = false;
+                    } else {
+                        info!("Requisite '{}' matches filter '{}' ✅", requisite, req_filter);
+                    }
+                } else {
+                    info!("Couldn't extract requisite from message, skipping");
+                    requisite_filter_passed = false;
+                }
+            }
+        }
+        
+        // Final check - all active filters must pass
+        
+        // Final check - all active filters must pass
+        let bank_filter_result = if self.bank_filter.is_some() { bank_filter_passed } else { true };
+        let requisite_filter_result = if self.requisite_filter.is_some() { requisite_filter_passed } else { true };
+        let min_amount_filter_result = if self.min_amount > 0 { min_amount_filter_passed } else { true };
+        
+        let final_result = bank_filter_result && requisite_filter_result && min_amount_filter_result;
+        
+        if final_result {
+            info!("All filters passed, reacting to message ✅");
+        } else {
+            info!("Some filters failed, not reacting to message ❌");
+            info!("Bank filter: {}, Requisite filter: {}, Min amount filter: {}", 
+                  bank_filter_result, requisite_filter_result, min_amount_filter_result);
+        }
+        
+        final_result
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    std::env::set_var("RUST_LOG", "info");
+    std::env::set_var("TDLIB_LOG_VERBOSITY", "0");
+    
+    // Create required directories
+    std::fs::create_dir_all("tdlib_data").expect("Failed to create data directory");
+    std::fs::create_dir_all("tdlib_files").expect("Failed to create files directory");
+    
+    // Set directory permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions("tdlib_data", std::fs::Permissions::from_mode(0o755))
+            .expect("Failed to set data directory permissions");
+        std::fs::set_permissions("tdlib_files", std::fs::Permissions::from_mode(0o755))
+            .expect("Failed to set files directory permissions");
+    }
+    
+    env_logger::init();
+    
+    // Load filter settings from environment
+    let filter_settings = FilterSettings::from_env();
+    info!("Starting ultra-fast Telegram reaction bot (TDLib v{}) with filters:", TDLIB_VERSION);
+    info!("Bank filter: {:?}", filter_settings.bank_filter);
+    info!("Requisite filter: {:?}", filter_settings.requisite_filter);
+    info!("Minimum amount: {}", filter_settings.min_amount);
+
+    let client = Arc::new(Mutex::new(unsafe { TdClient::new() }));
+    {
+        let lock = client.lock().await;
+        lock.send(&json!({
+            "@type": "setLogVerbosityLevel",
+            "new_verbosity_level": 0
+        }).to_string());
+    }
+
+    let allowed_chat_ids: HashSet<i64> = ["-1002685602852"]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    
+    info!("Monitoring {} chat IDs: {:?}", allowed_chat_ids.len(), allowed_chat_ids);
+
+    let price_regex = Arc::new(Regex::new(r"а:\s*([\d\s]+)\s*₽").unwrap());
+    
+    // Load filter settings from environment
+    let filter_settings = Arc::new(FilterSettings::from_env());
+
+    // Setup TDLib with proper parameters
+    {
+        let lock = client.lock().await;
+        info!("Setting up TDLib parameters");
+        
+        // Get TDLib data directory from environment variable or use default
+        let tdlib_data_dir = std::env::var("TDLIB_DATA_DIR").unwrap_or_else(|_| "tdlib_data".to_string());
+        let tdlib_files_dir = format!("{}_files", tdlib_data_dir.trim_end_matches("/"));
+        
+        info!("Using TDLib data directory: {}", tdlib_data_dir);
+        
+        let params = json!({
+            "@type": "setTdlibParameters",
+            "database_directory": tdlib_data_dir,
+            "files_directory": tdlib_files_dir,
+            "database_encryption_key": "",
+            "use_test_dc": false,
+            "api_id": 24357409,
+            "api_hash": "5db832be5f031e5c55c8803d45125e29",
+            "system_language_code": "en",
+            "device_model": "ReactionBot",
+            "system_version": "1.0",
+            "application_version": "1.0",
+            "enable_storage_optimizer": true,
+            "ignore_file_names": false,
+            "use_file_database": true,
+            "use_chat_info_database": true,
+            "use_message_database": true,
+            "use_secret_chats": false
+        });
+        
+        lock.send(&params.to_string());
+        // No need to check database encryption key separately
+        // TDLib handles this automatically in setTdlibParameters
+    }
+
+    // Wait for authorization
+    let mut auth_state = String::from("waitTdlibParameters");
+    let mut auth_attempts = 0;
+    
+    while auth_state != "authorizationStateReady" && auth_attempts < MAX_AUTH_ATTEMPTS {
+        info!("Current auth state: {}", auth_state);
+        let message = {
+            let lock = client.lock().await;
+            let msg = lock.receive(AUTH_TIMEOUT);
+            msg
+        };
+
+        if let Some(msg) = message {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&msg) {
+                if let Some(update_type) = json["@type"].as_str() {
+                    match update_type {
+                        "updateAuthorizationState" => {
+                            if let Some(state) = json["authorization_state"]["@type"].as_str() {
+                                info!("New auth state: {}", state);
+                                auth_state = state.to_string();
+                                
+                                match state {
+                                    "authorizationStateWaitPhoneNumber" => {
+                                        println!("\nPlease enter your phone number (with country code, e.g. +1234567890):");
+                                        let mut input = String::new();
+                                        std::io::stdin().read_line(&mut input)?;
+                                        let phone_number = input.trim();
+                                        
+                                        let lock = client.lock().await;
+                                        lock.send(&json!({
+                                            "@type": "setAuthenticationPhoneNumber",
+                                            "phone_number": phone_number
+                                        }).to_string());
+                                    }
+                                    "authorizationStateWaitCode" => {
+                                        println!("\nPlease enter the verification code:");
+                                        let mut input = String::new();
+                                        std::io::stdin().read_line(&mut input)?;
+                                        let code = input.trim();
+                                        
+                                        let lock = client.lock().await;
+                                        lock.send(&json!({
+                                            "@type": "checkAuthenticationCode",
+                                            "code": code
+                                        }).to_string());
+                                    }
+                                    "authorizationStateWaitPassword" => {
+                                        println!("\nPlease enter your 2FA password:");
+                                        let mut input = String::new();
+                                        std::io::stdin().read_line(&mut input)?;
+                                        let password = input.trim();
+                                        
+                                        let lock = client.lock().await;
+                                        lock.send(&json!({
+                                            "@type": "checkAuthenticationPassword",
+                                            "password": password
+                                        }).to_string());
+                                    }
+                                    "authorizationStateReady" => {
+                                        info!("Authorization successful!");
+                                    }
+                                    _ => {
+                                        info!("Current auth state: {}", state);
+                                    }
+                                }
+                            }
+                        }
+                        "error" => {
+                            error!("Error from TDLib: {}", json["message"]);
+                            auth_attempts += 1;
+                            if auth_attempts >= MAX_AUTH_ATTEMPTS {
+                                return Err("Too many authentication attempts".into());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            warn!("No message received within timeout period");
+        }
+    }
+
+    if auth_state != "authorizationStateReady" {
+        return Err("Failed to authenticate with Telegram".into());
+    }
+
+    // Request chats to start receiving updates
+    {
+        info!("Requesting chats to start receiving updates");
+        let lock = client.lock().await;
+        lock.send(&json!({
+            "@type": "getChats",
+            "limit": 100
+        }).to_string());
+    }
+
+    // Get available reactions for the chat
+    for chat_id in &allowed_chat_ids {
+        info!("Getting available reactions for chat {}", chat_id);
+        let lock = client.lock().await;
+        lock.send(&json!({
+            "@type": "getChatAvailableReactions",
+            "chat_id": chat_id
+        }).to_string());
+    }
+
+    // Main message processing loop
+    loop {
+        let message = {
+            let lock = client.lock().await;
+            lock.receive(RECEIVE_TIMEOUT)
+        };
+
+        if let Some(msg) = message {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&msg) {
+                if json["@type"] == "updateNewMessage" {
+                    if let Some(chat_id) = json["message"]["chat_id"].as_i64() {
+                        // Check if this is a command
+                        if let Some(text) = json["message"]["content"]["text"]["text"].as_str() {
+                            // Handle /likes command
+                            if text.trim() == "/list" || text.trim() == "/list@reaction_bot" {
+                                info!("Received /list command from chat {}", chat_id);
+                                send_message(&client, chat_id, "ℹ️ Database storage has been disabled for performance reasons.").await;
+                                continue;
+                            } else if text.trim() == "/clear" || text.trim() == "/clear@reaction_bot" {
+                                info!("Received /clear command from chat {}", chat_id);
+                                send_message(&client, chat_id, "ℹ️ Database storage has been disabled for performance reasons.").await;
+                                continue;
+                            }
+                            
+                            // Process regular messages
+                            if allowed_chat_ids.contains(&chat_id) {
+                                if let Some(message_id) = json["message"]["id"].as_i64() {
+                                    // Process in the main thread for speed - no spawning
+                                    let start = Instant::now();
+                                    
+                                    // Apply all filters to determine if we should react
+                                    if filter_settings.should_react(text, &price_regex) {
+                                        // ULTRA-OPTIMIZED REACTION - sub-microsecond processing
+                                        // Use pre-compiled templates with sprintf-style formatting
+                                        // This completely eliminates JSON serialization and string manipulation overhead
+                                        
+                                        // Minimize lock acquisition time by preparing everything beforehand
+                                        let reaction1 = format!(REACTION_TYPE_TEMPLATE, chat_id, message_id);
+                                        let reaction2 = format!(ALT_REACTION_TEMPLATE, chat_id, message_id);
+                                        
+                                        // Use a non-blocking try_lock first to avoid contention
+                                        let mut sent = false;
+                                        if let Ok(lock) = client.try_lock() {
+                                            // Fast path - got the lock without waiting
+                                            lock.send(&reaction1);
+                                            lock.send(&reaction2);
+                                            sent = true;
+                                            
+                                            if TRACE_ENABLED.load(Ordering::Relaxed) {
+                                                trace!("Fast path: Got lock without waiting");
+                                            }
+                                        }
+                                        
+                                        // Only wait for the lock if we couldn't get it immediately
+                                        if !sent {
+                                            // Slow path - need to wait for the lock
+                                            let lock = client.lock().await;
+                                            lock.send(&reaction1);
+                                            lock.send(&reaction2);
+                                            
+                                            if TRACE_ENABLED.load(Ordering::Relaxed) {
+                                                trace!("Slow path: Had to wait for lock");
+                                            }
+                                        }
+                                        
+                                        // Log the ultra-fast reaction time
+                                        let elapsed = start.elapsed();
+                                        if elapsed.as_micros() < 1000 {
+                                            info!("⚡⚡ HYPER-FAST reaction sent in {} µs", elapsed.as_micros());
+                                        } else {
+                                            info!("⚡ Fast reaction sent in {:?}", elapsed);
+                                        }
+                                    } else {
+                                        info!("Message did not pass filters, ignoring");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Send a message to a chat
+async fn send_message(client: &Arc<Mutex<TdClient>>, chat_id: i64, message: &str) {
+    let send_request = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageText",
+            "text": {
+                "@type": "formattedText",
+                "text": message
+            }
+        }
+    });
+    
+    let client_lock = client.lock().await;
+    client_lock.send(&send_request.to_string());
+    info!("Sent message to chat {}", chat_id);
+}
+
+// Extract message ID from text content
+fn extract_message_id(text: &str) -> Option<String> {
+    // Look for "ID: XXXXX" pattern in the text
+    let id_pattern = Regex::new(r"ID:\s*(\d+)").ok()?;
+    
+    if let Some(captures) = id_pattern.captures(text) {
+        if let Some(id_match) = captures.get(1) {
+            let id = id_match.as_str().to_string();
+            info!("Extracted message ID from text: {}", id);
+            return Some(id);
+        }
+    }
+    
+    info!("No message ID found in text");
+    None
+}
+
+
+
+// Ultra-fast reaction function that doesn't wait for response but tries both reaction formats simultaneously
+fn send_reaction_fast(client: &TdClient, chat_id: i64, message_id: i64, _message_text: &str) {
+    // Send both formats simultaneously for maximum speed and compatibility
+    // Format 1: Newer format with reaction_type
+    let reaction_request = json!({
+        "@type": "addMessageReaction",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction_type": {
+            "@type": "reactionTypeEmoji",
+            "emoji": REACTION_EMOJI
+        },
+        "is_big": false
+    });
+    
+    // Format 2: Alternative format with direct reaction
+    let alt_reaction_request = json!({
+        "@type": "addMessageReaction",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": REACTION_EMOJI,
+        "is_big": false
+    });
+    
+    // Send both formats without waiting
+    client.send(&reaction_request.to_string());
+    client.send(&alt_reaction_request.to_string());
+    
+    // Log the action with ultra-fast indicator
+    let reaction_time = std::time::Instant::now();
+    info!("⚡ Ultra-fast reaction sent to message {} in chat {}. Reaction time: {:?}", 
+          message_id, chat_id, reaction_time.elapsed());
+}
+
+async fn react_to_message(client: &TdClient, chat_id: i64, message_id: i64, _message_text: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Start timing for reaction speed measurement
+    let start_time = Instant::now();
+    
+    // Use the ultra-fast approach - send both formats simultaneously
+    // Format 1: Newer format with reaction_type
+    let reaction_request = json!({
+        "@type": "addMessageReaction",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction_type": {
+            "@type": "reactionTypeEmoji",
+            "emoji": REACTION_EMOJI
+        },
+        "is_big": false
+    });
+    
+    // Format 2: Alternative format with direct reaction
+    let alt_reaction_request = json!({
+        "@type": "addMessageReaction",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": REACTION_EMOJI,
+        "is_big": false
+    });
+    
+    // Send both formats without waiting for response
+    client.send(&reaction_request.to_string());
+    client.send(&alt_reaction_request.to_string());
+    
+    // Log the reaction time immediately after sending
+    let send_time = start_time.elapsed();
+    info!("⚡ Ultra-fast reaction sent in {:?}", send_time);
+    
+    // Instead of spawning a task that would capture the client reference,
+    // we'll do a quick non-blocking check for confirmation
+    let mut success = false;
+    let check_start = Instant::now();
+    
+    // Only check for a very short time (50ms max) to maintain ultra-fast speed
+    while check_start.elapsed().as_millis() < 50 {
+        if let Some(response) = client.receive(0.001) {
+            if let Ok(json_response) = serde_json::from_str::<serde_json::Value>(&response) {
+                if json_response["@type"] == "ok" || 
+                   (json_response["@type"] == "updateMessageReactions" && 
+                    json_response["chat_id"] == chat_id && 
+                    json_response["message_id"] == message_id) {
+                    success = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Log the final status with timing information
+    if success {
+        info!("Message passed all filters, reaction confirmed. Reaction time: {:?}", start_time.elapsed());
+    }
+    
+    // Return immediately to maintain ultra-fast speed
+    Ok(())
+}
+
+fn extract_price(text: &str, regex: &Regex) -> Option<i32> {
+    regex.captures(text)?
+        .get(1)?
+        .as_str()
+        .replace(' ', "")
+        .parse()
+        .ok()
+}

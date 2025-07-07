@@ -1,0 +1,39 @@
+# Environment files
+.env
+.env.local
+.env.production
+
+# Telegram session files
+*.session
+*.session-journal
+
+# TDLib data
+tdlib_data/
+tdlib_files/
+td.binlog
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker volumes
+docker-volumes/ 

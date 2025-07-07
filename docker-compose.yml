@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # Telegram Reaction Bot (основной бот реакций)
+  reaction-bot:
+    build: ./telegram-reaction-bot
+    container_name: telegram-reaction-bot
+    restart: unless-stopped
+    environment:
+      # Telegram API credentials (ОБЯЗАТЕЛЬНО измените!)
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      
+      # Разрешенные чаты (через запятую)
+      - ALLOWED_CHAT_IDS=${ALLOWED_CHAT_IDS:-}
+      
+      # Настройки фильтров (опционально)
+      - BANK_FILTER=${BANK_FILTER:-}
+      - REQUISITE_FILTER=${REQUISITE_FILTER:-}
+      - MIN_AMOUNT=${MIN_AMOUNT:-38000}
+      
+      # Настройки логирования
+      - RUST_LOG=info
+      - TDLIB_LOG_VERBOSITY=0
+    volumes:
+      # Сохраняем данные TDLib между перезапусками
+      - reaction_bot_data:/app/tdlib_data
+      - reaction_bot_files:/app/tdlib_files
+    networks:
+      - telegram-bots
+
+  # Telegram Manager Bot (контрольный бот)
+  manager-bot:
+    build: ./telegram-likes-manager-bot
+    container_name: telegram-manager-bot
+    restart: unless-stopped
+    environment:
+      # Telegram Bot Token (ОБЯЗАТЕЛЬНО измените!)
+      - BOT_TOKEN=${BOT_TOKEN}
+      
+      # Разрешенные пользователи (через запятую)
+      - ALLOWED_USERS=${ALLOWED_USERS}
+      
+      # Путь к основному боту (внутри Docker)
+      - REACTION_BOT_PATH=/app
+    depends_on:
+      - reaction-bot
+    networks:
+      - telegram-bots
+
+volumes:
+  reaction_bot_data:
+  reaction_bot_files:
+
+networks:
+  telegram-bots:
+    driver: bridge 
