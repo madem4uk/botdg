@@ -26,7 +26,7 @@ RUN git clone https://github.com/tdlib/td.git && \
 WORKDIR /app
 
 # Copy Cargo files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml ./
 
 # Create a dummy main.rs to build dependencies
 RUN mkdir src && \
