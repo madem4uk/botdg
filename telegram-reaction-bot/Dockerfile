@@ -12,20 +12,24 @@ RUN apt-get update && apt-get install -y \
     php-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build TDLib
-RUN git clone https://github.com/tdlib/td.git && \
-    cd td && \
-    mkdir build && \
-    cd build && \
-    cmake -DCMAKE_BUILD_TYPE=Release .. && \
-    cmake --build . --target install && \
-    cd ../.. && \
-    rm -rf td
+# Clone and build TDLib only if not already present
+RUN if [ ! -f "/usr/local/lib/libtdjson.so" ]; then \
+        git clone https://github.com/tdlib/td.git && \
+        cd td && \
+        mkdir build && \
+        cd build && \
+        cmake -DCMAKE_BUILD_TYPE=Release .. && \
+        cmake --build . --target install && \
+        cd ../.. && \
+        rm -rf td; \
+    else \
+        echo "TDLib already installed, skipping..."; \
+    fi
 
 # Set working directory
 WORKDIR /app
 
-# Copy Cargo files
+# Copy Cargo files first (for better caching)
 COPY Cargo.toml ./
 
 # Create a dummy main.rs to build dependencies
@@ -40,12 +44,12 @@ COPY src ./src
 # Build the application
 RUN cargo build --release
 
-# Runtime stage
-FROM debian:bullseye-slim
+# Runtime stage - use Ubuntu 22.04 for better GLIBC compatibility
+FROM ubuntu:22.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    libssl1.1 \
+    libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

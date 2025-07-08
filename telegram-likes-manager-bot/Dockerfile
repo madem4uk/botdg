@@ -26,12 +26,12 @@ COPY src ./src
 # Build the application
 RUN cargo build --release
 
-# Runtime stage
-FROM debian:bullseye-slim
+# Runtime stage - use Ubuntu 22.04 for better GLIBC compatibility
+FROM ubuntu:22.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    libssl1.1 \
+    libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
