@@ -12,20 +12,6 @@ RUN apt-get update && apt-get install -y \
     php-cli \
     && rm -rf /var/lib/apt/lists/*
 
-# Clone and build TDLib only if not already present
-RUN if [ ! -f "/usr/local/lib/libtdjson.so" ]; then \
-        git clone https://github.com/tdlib/td.git && \
-        cd td && \
-        mkdir build && \
-        cd build && \
-        cmake -DCMAKE_BUILD_TYPE=Release .. && \
-        cmake --build . --target install && \
-        cd ../.. && \
-        rm -rf td; \
-    else \
-        echo "TDLib already installed, skipping..."; \
-    fi
-
 # Set working directory
 WORKDIR /app
 
@@ -52,10 +38,6 @@ RUN apt-get update && apt-get install -y \
     libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Copy TDLib from builder
-COPY --from=builder /usr/local/lib/libtdjson.so* /usr/local/lib/
-RUN ldconfig
 
 # Create app user
 RUN useradd -m -u 1000 app
