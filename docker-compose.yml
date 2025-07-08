@@ -27,8 +27,8 @@ services:
       - reaction_bot_data:/app/tdlib_data
       - reaction_bot_files:/app/tdlib_files
       # Используем предустановленный TDLib на сервере
-      - /usr/local/lib/libtdjson.so:/usr/local/lib/libtdjson.so:ro
       - /usr/local/lib/libtdjson.so.1.8.51:/usr/local/lib/libtdjson.so.1.8.51:ro
+      - /usr/local/lib/libtdjson.so:/usr/local/lib/libtdjson.so:ro
     networks:
       - telegram-bots
 

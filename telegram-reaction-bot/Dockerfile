@@ -55,6 +55,11 @@ COPY env.example /app/env.example
 RUN mkdir -p /app/tdlib_data /app/tdlib_files && \
     chown -R app:app /app
 
+# Create TDLib directory and set up symbolic links
+RUN mkdir -p /usr/local/lib && \
+    ln -sf /usr/local/lib/libtdjson.so.1.8.51 /usr/local/lib/libtdjson.so && \
+    ldconfig
+
 # Switch to app user
 USER app
 
